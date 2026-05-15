@@ -18,9 +18,9 @@ async function sendTelegramMessage(message, imagePath = null) {
             text: message,
             parse_mode: 'Markdown'
         });
-        console.log('[Telegram] Message sent.');
+        console.log('[Telegram] 消息已发送');
     } catch (e) {
-        console.error('[Telegram] Failed to send message:', e.message);
+        console.error('[Telegram] 发送失败:', e.message);
     }
 
     if (imagePath && fs.existsSync(imagePath)) {
@@ -50,55 +50,48 @@ if (HTTP_PROXY) {
 const INJECTED_SCRIPT = `
 (function() {
     setInterval(() => {
-        // 监控 ALTCHA (续期用)
+        // 监控 ALTCHA (续期弹窗用)
         const altchaInput = document.querySelector('input[name="altcha"]');
         if (altchaInput && altchaInput.value && altchaInput.value.length > 30) {
             window.__altcha_done = true;
         }
-        
-        // 监控 Turnstile (登录用)
-        if (window.turnstile) {
-             const widget = document.querySelector('[id^="cf-chl-widget-"]');
-             if (widget) window.__has_turnstile = true;
-        }
     }, 1000);
 
-    // 拦截 ShadowRoot 寻找复选框坐标
+    // 监控 ShadowRoot 寻找 Cloudflare 复选框坐标
     const originalAttachShadow = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function(init) {
         const shadowRoot = originalAttachShadow.call(this, init);
-        setTimeout(() => {
-            const check = () => {
-                const cb = shadowRoot.querySelector('input[type="checkbox"]');
-                if (cb) {
-                    const rect = cb.getBoundingClientRect();
+        const check = () => {
+            const cb = shadowRoot.querySelector('input[type="checkbox"]');
+            if (cb) {
+                const rect = cb.getBoundingClientRect();
+                if (rect.width > 0) {
                     window.__turnstile_data = { 
                         xRatio: (rect.left + rect.width / 2) / window.innerWidth,
                         yRatio: (rect.top + rect.height / 2) / window.innerHeight
                     };
                 }
-            };
-            check();
-            new MutationObserver(check).observe(shadowRoot, {childList:true, subtree:true});
-        }, 100);
+            }
+        };
+        setInterval(check, 1000);
         return shadowRoot;
     };
 })();
 `;
 
 async function handleCaptcha(page, context = 'login') {
-    console.log(`   >> [${context}] 正在处理验证码...`);
+    console.log(`   >> [${context}] 正在检测验证码...`);
     
-    // 优先检测 Cloudflare Turnstile (通常在登录页)
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 20; i++) {
+        // 1. 处理 Cloudflare Turnstile
         const turnstileData = await page.evaluate(() => window.__turnstile_data).catch(() => null);
         if (turnstileData) {
-            console.log('   >> 检测到 Turnstile 复选框，尝试 CDP 点击...');
+            console.log('   >> 发现 Turnstile 复选框，执行 CDP 点击...');
             const frames = page.frames();
             for (const frame of frames) {
-                const iframeElement = await frame.frameElement().catch(() => null);
-                if (!iframeElement) continue;
-                const box = await iframeElement.boundingBox();
+                const iframe = await frame.frameElement().catch(() => null);
+                if (!iframe) continue;
+                const box = await iframe.boundingBox();
                 if (box && box.width > 0) {
                     const clickX = box.x + (box.width * turnstileData.xRatio);
                     const clickY = box.y + (box.height * turnstileData.yRatio);
@@ -106,23 +99,20 @@ async function handleCaptcha(page, context = 'login') {
                     await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1 });
                     await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1 });
                     await client.detach();
-                    console.log('   >> CDP 点击已发送。');
-                    await page.waitForTimeout(3000);
-                    return true;
                 }
             }
         }
         
-        // 检查 ALTCHA (通常在续期弹窗)
+        // 2. 处理 ALTCHA
         const isAltchaDone = await page.evaluate(() => window.__altcha_done).catch(() => false);
         if (isAltchaDone) {
-            console.log('   >> ✅ ALTCHA PoW 计算完成。');
+            console.log('   >> ✅ ALTCHA 验证完成');
             return true;
         }
         
+        // 检查页面是否已经通过验证 (例如登录按钮变亮或加载条消失)
         await page.waitForTimeout(1000);
     }
-    console.log('   >> 未能自动完成验证，尝试继续后续操作...');
     return false;
 }
 
@@ -133,8 +123,7 @@ async function launchChrome() {
     chrome.unref();
     for (let i = 0; i < 20; i++) {
         const portOpen = await new Promise(res => {
-            const req = http.get(`http://localhost:${DEBUG_PORT}/json/version`, () => res(true)).on('error', () => res(false));
-            req.end();
+            http.get(`http://localhost:${DEBUG_PORT}/json/version`, () => res(true)).on('error', () => res(false)).end();
         });
         if (portOpen) break;
         await new Promise(r => setTimeout(r, 1000));
@@ -154,10 +143,8 @@ async function launchChrome() {
     const photoDir = path.join(process.cwd(), 'screenshots');
     if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
 
-    for (let i = 0; i < users.length; i++) {
-        const user = users[i];
-        console.log(`\n=== 正在处理用户 ${i + 1}/${users.length}: ${user.username} ===`);
-
+    for (const user of users) {
+        console.log(`\n=== 用户: ${user.username} ===`);
         try {
             await page.goto('https://dashboard.katabump.com/auth/login');
             await page.waitForTimeout(3000);
@@ -167,15 +154,15 @@ async function launchChrome() {
                 await page.getByRole('textbox', { name: 'Password' }).fill(user.password);
                 
                 await handleCaptcha(page, 'Login'); 
-                await page.getByRole('button', { name: 'Login' }).click();
+                // 修复严格模式：明确指定点击第一个 "Login" 按钮，且排除 Discord 按钮
+                await page.getByRole('button', { name: 'Login', exact: true }).click();
                 await page.waitForTimeout(5000);
             }
 
-            // 检查是否登录成功
             if (page.url().includes('/auth/login')) {
-                 console.log('   >> 登录未跳转，尝试第二次点击登录按钮...');
-                 await page.getByRole('button', { name: 'Login' }).click();
-                 await page.waitForTimeout(5000);
+                console.log('   >> 登录未跳转，尝试二次确认...');
+                await page.getByRole('button', { name: 'Login', exact: true }).click();
+                await page.waitForTimeout(5000);
             }
 
             await page.goto('https://dashboard.katabump.com/dashboard/server');
@@ -183,39 +170,34 @@ async function launchChrome() {
             await seeBtn.waitFor({ state: 'visible', timeout: 15000 });
             await seeBtn.click();
             
-            // Renew 逻辑
             await page.waitForTimeout(3000);
             const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
             
             if (await renewBtn.isVisible()) {
                 await renewBtn.click();
-                await page.locator('#renew-modal').waitFor({ state: 'visible' });
-                console.log('   >> 续期弹窗已打开');
+                const modal = page.locator('#renew-modal');
+                await modal.waitFor({ state: 'visible' });
 
-                await handleCaptcha(page, 'Renew'); // 这里处理 ALTCHA
+                await handleCaptcha(page, 'Renew'); 
                 
                 const shot = path.join(photoDir, `${user.username}_renew.png`);
                 await page.screenshot({ path: shot });
 
-                await page.locator('#renew-modal').getByRole('button', { name: 'Renew' }).click();
+                await modal.getByRole('button', { name: 'Renew' }).click();
                 await page.waitForTimeout(4000);
                 
-                if (!await page.locator('#renew-modal').isVisible()) {
-                    console.log('   >> ✅ 续期指令发送成功！');
-                    await sendTelegramMessage(`✅ 用户 ${user.username} 续期操作完成`, shot);
-                } else {
-                    console.log('   >> ⚠️ 续期弹窗仍未关闭，可能失败。');
+                if (!await modal.isVisible()) {
+                    console.log('   >> ✅ 续期操作成功');
+                    await sendTelegramMessage(`✅ 用户 ${user.username} 续期成功`, shot);
                 }
             } else {
-                console.log('   >> 💡 未发现 Renew 按钮，可能时间未到。');
+                console.log('   >> 💡 尚未到续期时间');
             }
-
         } catch (err) {
-            console.error(`   >> ❌ 运行出错: ${err.message}`);
-            await page.screenshot({ path: path.join(photoDir, `${user.username}_error.png`) });
+            console.error(`   >> ❌ 错误: ${err.message}`);
+            await page.screenshot({ path: path.join(photoDir, `${user.username}_err.png`) });
         }
     }
-
     await browser.close();
     process.exit(0);
 })();
